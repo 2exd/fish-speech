@@ -30,23 +30,23 @@ if hasattr(torch._inductor.config, "fx_graph_cache"):
     # Experimental feature to reduce compilation times, will be on by default in future
     torch._inductor.config.fx_graph_cache = True
 
-
 from fish_speech.models.text2semantic.llama import DualARTransformer, NaiveTransformer
 
 
 def multinomial_sample_one_no_sync(
-    probs_sort,
-):  # Does multinomial sampling without a cuda synchronization
+        probs_sort,
+):  # 无 CUDA 同步的多项式采样，减少延迟
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
+# 将逻辑值转换为概率值，应用应用重复惩罚和top-p采样
 def logits_to_probs(
-    logits,
-    previous_tokens: Optional[torch.Tensor] = None,
-    temperature: torch.Tensor = 1.0,
-    top_p: torch.Tensor = 1.0,
-    repetition_penalty: torch.Tensor = 1.0,
+        logits,
+        previous_tokens: Optional[torch.Tensor] = None,
+        temperature: torch.Tensor = 1.0,
+        top_p: torch.Tensor = 1.0,
+        repetition_penalty: torch.Tensor = 1.0,
 ) -> torch.Tensor:
     # Apply repetition penalty
     if previous_tokens is not None:
@@ -73,10 +73,11 @@ def logits_to_probs(
     return probs
 
 
+# 从logits中采样下一个token
 def sample(
-    logits,
-    previous_tokens: Optional[torch.Tensor] = None,
-    **sampling_kwargs,
+        logits,
+        previous_tokens: Optional[torch.Tensor] = None,
+        **sampling_kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     probs = logits_to_probs(
         logits=logits[0, -1], previous_tokens=previous_tokens, **sampling_kwargs
@@ -85,12 +86,13 @@ def sample(
     return idx_next, probs
 
 
+# 解码函数
 def decode_one_token_ar(
-    model: DualARTransformer,
-    x: torch.Tensor,
-    input_pos: torch.Tensor,
-    previous_tokens: torch.Tensor = None,
-    **sampling_kwargs,
+        model: DualARTransformer,
+        x: torch.Tensor,
+        input_pos: torch.Tensor,
+        previous_tokens: torch.Tensor = None,
+        **sampling_kwargs,
 ) -> torch.Tensor:
     x = model.forward_generate(x, input_pos)
     codebooks = [
@@ -125,12 +127,13 @@ def decode_one_token_ar(
     return torch.stack(codebooks, dim=0)
 
 
+# 解码函数
 def decode_one_token_naive(
-    model: NaiveTransformer,
-    x: torch.Tensor,
-    input_pos: torch.Tensor,
-    previous_tokens: torch.Tensor = None,
-    **sampling_kwargs,
+        model: NaiveTransformer,
+        x: torch.Tensor,
+        input_pos: torch.Tensor,
+        previous_tokens: torch.Tensor = None,
+        **sampling_kwargs,
 ) -> torch.Tensor:
     x = model.forward_generate(x, input_pos)
 
@@ -156,15 +159,16 @@ def decode_one_token_naive(
     return torch.stack(codebooks, dim=0)
 
 
+# 多步解码函数
 def decode_n_tokens(
-    model: NaiveTransformer,
-    cur_token: torch.Tensor,
-    input_pos: torch.Tensor,
-    num_new_tokens: int,
-    eos_token_id: int = 2,
-    im_end_id: int = 4,
-    decode_one_token=decode_one_token_naive,
-    **sampling_kwargs,
+        model: NaiveTransformer,
+        cur_token: torch.Tensor,
+        input_pos: torch.Tensor,
+        num_new_tokens: int,
+        eos_token_id: int = 2,
+        im_end_id: int = 4,
+        decode_one_token=decode_one_token_naive,
+        **sampling_kwargs,
 ):
     previous_tokens = torch.zeros(
         (model.config.num_codebooks + 1, model.config.max_seq_len),
@@ -178,10 +182,10 @@ def decode_n_tokens(
         if i < win_size:
             window = previous_tokens[:, :win_size]
         else:
-            window = previous_tokens[:, i - win_size : i]
+            window = previous_tokens[:, i - win_size: i]
 
         with torch.backends.cuda.sdp_kernel(
-            enable_flash=False, enable_mem_efficient=False, enable_math=True
+                enable_flash=False, enable_mem_efficient=False, enable_math=True
         ):  # Actually better for Inductor to codegen attention here
             next_token = decode_one_token(
                 model=model,
@@ -193,31 +197,32 @@ def decode_n_tokens(
 
         input_pos += 1
         cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
-        previous_tokens[:, i : i + 1] = next_token.view(
+        previous_tokens[:, i: i + 1] = next_token.view(
             model.config.num_codebooks + 1, -1
         )
 
         if (
-            cur_token[0, 0, -1] == eos_token_id
-            or cur_token[0, 0, -1] == im_end_id
-            or (cur_token[0, 1:, -1] == CODEBOOK_EOS_TOKEN_ID).any()
+                cur_token[0, 0, -1] == eos_token_id
+                or cur_token[0, 0, -1] == im_end_id
+                or (cur_token[0, 1:, -1] == CODEBOOK_EOS_TOKEN_ID).any()
         ):
             break
 
     return previous_tokens[:, : i + 1]
 
 
-@torch.no_grad()
-@torch.inference_mode()
+# 生成文本函数
+@torch.no_grad()  # 禁用梯度计算，减少内存使用和加速
+@torch.inference_mode()  # 开启推理模式，进一步优化性能
 def generate(
-    *,
-    model: NaiveTransformer,
-    prompt: torch.Tensor,
-    max_new_tokens: int,
-    eos_token_id: int = 2,
-    im_end_id: int = 4,
-    decode_one_token=decode_one_token_naive,
-    **sampling_kwargs,
+        *,
+        model: NaiveTransformer,
+        prompt: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: int = 2,
+        im_end_id: int = 4,
+        decode_one_token=decode_one_token_naive,
+        **sampling_kwargs,
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -226,6 +231,7 @@ def generate(
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(1)
 
+    # 如果请求生成的新令牌数超过模型配置的最大序列长度，则进行调整
     if max_new_tokens:
         if T + max_new_tokens > model.config.max_seq_len:
             max_new_tokens = model.config.max_seq_len - T
@@ -258,7 +264,7 @@ def generate(
     next_token = prefill_decode(
         model, prompt.view(1, codebook_dim, -1), input_pos, **sampling_kwargs
     )
-    seq[:, T : T + 1] = next_token
+    seq[:, T: T + 1] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     x = decode_n_tokens(
@@ -273,19 +279,19 @@ def generate(
     )
     # x = torch.cat(generated_tokens, dim=1)
     seq = seq[:, : T + 1 + x.size(1)]
-    seq[:, T + 1 :] = x
+    seq[:, T + 1:] = x
 
     return seq
 
 
 def encode_tokens(
-    tokenizer,
-    string,
-    bos=True,
-    device="cuda",
-    prompt_tokens=None,
-    speaker=None,
-    num_codebooks=4,
+        tokenizer,
+        string,
+        bos=True,
+        device="cuda",
+        prompt_tokens=None,
+        speaker=None,
+        num_codebooks=4,
 ):
     string = clean_text(string)
 
@@ -301,15 +307,15 @@ def encode_tokens(
     new_tokens = tokenizer.encode(
         string,
         add_special_tokens=False,
-        max_length=10**6,
+        max_length=10 ** 6,
         truncation=False,
     )
     tokens = torch.tensor([new_tokens], dtype=torch.int, device=device)
 
     # Codebooks
     zeros = (
-        torch.ones((num_codebooks, tokens.size(1)), dtype=torch.int, device=device)
-        * CODEBOOK_PAD_TOKEN_ID
+            torch.ones((num_codebooks, tokens.size(1)), dtype=torch.int, device=device)
+            * CODEBOOK_PAD_TOKEN_ID
     )
     prompt = torch.cat((tokens, zeros), dim=0)
 
@@ -319,7 +325,7 @@ def encode_tokens(
     # Get prompt tokens
     if prompt_tokens.ndim == 3:
         assert (
-            prompt_tokens.shape[0] == 1
+                prompt_tokens.shape[0] == 1
         ), f"3 dim prompt tokens should have shape (1, num_codebooks, seq_len)"
         prompt_tokens = prompt_tokens[0]
 
@@ -346,7 +352,7 @@ def encode_tokens(
     s0_token_id = tokenizer.convert_tokens_to_ids("<|semantic|>")
     end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     main_token_ids = (
-        torch.ones((1, data.size(1)), dtype=torch.int, device=device) * s0_token_id
+            torch.ones((1, data.size(1)), dtype=torch.int, device=device) * s0_token_id
     )
     main_token_ids[0, -1] = end_token_id
 
@@ -357,7 +363,7 @@ def encode_tokens(
 
 
 def load_model(
-    config_name, checkpoint_path, device, precision, max_length, compile=False
+        config_name, checkpoint_path, device, precision, max_length, compile=False
 ):
     hydra.core.global_hydra.GlobalHydra.instance().clear()
     with initialize(version_base="1.3", config_path="../../fish_speech/configs/model"):
@@ -424,24 +430,24 @@ class GenerateResponse:
 
 
 def generate_long(
-    *,
-    model,
-    tokenizer: callable,
-    device: str | torch.device,
-    decode_one_token: callable,
-    text: str,
-    num_samples: int = 1,
-    max_new_tokens: int = 0,
-    top_p: int = 0.7,
-    repetition_penalty: float = 1.5,
-    temperature: float = 0.7,
-    compile: bool = False,
-    iterative_prompt: bool = True,
-    max_length: int = 2048,
-    chunk_length: int = 150,
-    speaker: Optional[str] = None,
-    prompt_text: Optional[str | list[str]] = None,
-    prompt_tokens: Optional[torch.Tensor | list[torch.Tensor]] = None,
+        *,
+        model,
+        tokenizer: callable,
+        device: str | torch.device,
+        decode_one_token: callable,
+        text: str,
+        num_samples: int = 1,
+        max_new_tokens: int = 0,
+        top_p: int = 0.7,
+        repetition_penalty: float = 1.5,
+        temperature: float = 0.7,
+        compile: bool = False,
+        iterative_prompt: bool = True,
+        max_length: int = 2048,
+        chunk_length: int = 150,
+        speaker: Optional[str] = None,
+        prompt_text: Optional[str | list[str]] = None,
+        prompt_tokens: Optional[torch.Tensor | list[torch.Tensor]] = None,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < repetition_penalty < 2, "repetition_penalty must be in (0, 2)"
@@ -520,7 +526,7 @@ def generate_long(
             for i, length in enumerate(lengths):
                 count += length
                 if count + length > max_length - 1024 - sum(
-                    t.shape[1] for t in encoded_prompts
+                        t.shape[1] for t in encoded_prompts
                 ):
                     break
 
@@ -611,12 +617,12 @@ class GenerateRequest:
 
 
 def launch_thread_safe_queue(
-    config_name,
-    checkpoint_path,
-    device,
-    precision,
-    max_length: int,
-    compile: bool = False,
+        config_name,
+        checkpoint_path,
+        device,
+        precision,
+        max_length: int,
+        compile: bool = False,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
@@ -637,7 +643,7 @@ def launch_thread_safe_queue(
 
             try:
                 for chunk in generate_long(
-                    model=model, decode_one_token=decode_one_token, **kwargs
+                        model=model, decode_one_token=decode_one_token, **kwargs
                 ):
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=chunk)
@@ -684,29 +690,30 @@ def launch_thread_safe_queue(
 @click.option("--max-length", type=int, default=2048)
 @click.option("--chunk-length", type=int, default=150)
 def main(
-    text: str,
-    prompt_text: Optional[list[str]],
-    prompt_tokens: Optional[list[Path]],
-    num_samples: int,
-    max_new_tokens: int,
-    top_p: int,
-    repetition_penalty: float,
-    temperature: float,
-    checkpoint_path: Path,
-    config_name: str,
-    tokenizer: str,
-    compile: bool,
-    seed: int,
-    speaker: Optional[str],
-    half: bool,
-    iterative_prompt: bool,
-    max_length: int,
-    chunk_length: int,
+        text: str,
+        prompt_text: Optional[list[str]],
+        prompt_tokens: Optional[list[Path]],
+        num_samples: int,
+        max_new_tokens: int,
+        top_p: int,
+        repetition_penalty: float,
+        temperature: float,
+        checkpoint_path: Path,
+        config_name: str,
+        tokenizer: str,
+        compile: bool,
+        seed: int,
+        speaker: Optional[str],
+        half: bool,
+        iterative_prompt: bool,
+        max_length: int,
+        chunk_length: int,
 ) -> None:
     device = "cuda"
 
     precision = torch.half if half else torch.bfloat16
 
+    # 检查prompt_text和prompt_tokens的长度是否匹配
     if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
         raise ValueError(
             f"Number of prompt text ({len(prompt_text)}) and prompt tokens ({len(prompt_tokens)}) should be the same"
@@ -727,6 +734,8 @@ def main(
         prompt_tokens = [torch.from_numpy(np.load(p)).to(device) for p in prompt_tokens]
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+
+    # 设置随机种子以保证结果的可重现性
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
